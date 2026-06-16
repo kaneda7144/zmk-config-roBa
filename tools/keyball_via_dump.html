@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keyball39 VIA Keymap Dump</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+    body {
+      max-width: 960px;
+      margin: 32px auto;
+      padding: 0 20px;
+    }
+    button, input {
+      font: inherit;
+      padding: 8px 12px;
+    }
+    button {
+      cursor: pointer;
+      margin-right: 8px;
+    }
+    textarea {
+      box-sizing: border-box;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      min-height: 420px;
+      width: 100%;
+    }
+    .row {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 16px 0;
+    }
+    .muted {
+      color: #666;
+    }
+    #log {
+      background: rgba(127, 127, 127, 0.12);
+      border-radius: 6px;
+      min-height: 72px;
+      padding: 12px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>Keyball39 VIA Keymap Dump</h1>
+  <p>
+    Keyball39のVIA/Remap動的キーマップ領域を読み出してJSON化します。
+    書き込みは行いません。
+  </p>
+
+  <div class="row">
+    <button id="connect">Keyball39に接続</button>
+    <button id="dump" disabled>キーマップを読み出す</button>
+    <button id="download" disabled>JSONを保存</button>
+  </div>
+
+  <div class="row">
+    <label>Rows <input id="rows" type="number" min="1" max="16" value="8"></label>
+    <label>Cols <input id="cols" type="number" min="1" max="16" value="6"></label>
+    <label>最大Layer <input id="maxLayers" type="number" min="1" max="16" value="8"></label>
+  </div>
+
+  <p class="muted">
+    ChromeまたはEdgeで <code>http://localhost</code> から開いてください。
+    Keyball39の既定VID/PIDは <code>0x5957:0x0200</code> です。
+  </p>
+
+  <h2>Log</h2>
+  <pre id="log"></pre>
+
+  <h2>Dump JSON</h2>
+  <textarea id="output" spellcheck="false"></textarea>
+
+  <script>
+    const KEYBALL39_VENDOR_ID = 0x5957;
+    const KEYBALL39_PRODUCT_ID = 0x0200;
+    const RAW_BUFFER_SIZE = 32;
+    const CHUNK_SIZE = 28;
+
+    const IDS = {
+      GET_PROTOCOL_VERSION: 0x01,
+      GET_KEYBOARD_VALUE: 0x02,
+      DYNAMIC_KEYMAP_MACRO_GET_COUNT: 0x0c,
+      DYNAMIC_KEYMAP_MACRO_GET_BUFFER_SIZE: 0x0d,
+      DYNAMIC_KEYMAP_MACRO_GET_BUFFER: 0x0e,
+      DYNAMIC_KEYMAP_GET_LAYER_COUNT: 0x11,
+      DYNAMIC_KEYMAP_GET_BUFFER: 0x12,
+    };
+
+    let device = null;
+    let outputReportId = 0;
+    let latestJson = "";
+
+    const logEl = document.getElementById("log");
+    const outputEl = document.getElementById("output");
+    const connectButton = document.getElementById("connect");
+    const dumpButton = document.getElementById("dump");
+    const downloadButton = document.getElementById("download");
+
+    function log(message) {
+      logEl.textContent += `${new Date().toLocaleTimeString()}  ${message}\n`;
+    }
+
+    function toHex(value, width = 4) {
+      return `0x${value.toString(16).toUpperCase().padStart(width, "0")}`;
+    }
+
+    function bytesToHex(bytes) {
+      return Array.from(bytes, (byte) => byte.toString(16).toUpperCase().padStart(2, "0")).join(" ");
+    }
+
+    function getOutputReportId(hidDevice) {
+      for (const collection of hidDevice.collections || []) {
+        if (collection.outputReports && collection.outputReports.length > 0) {
+          return collection.outputReports[0].reportId || 0;
+        }
+      }
+      return 0;
+    }
+
+    function sendCommand(request, matcher, timeoutMs = 1500) {
+      return new Promise(async (resolve, reject) => {
+        if (!device || !device.opened) {
+          reject(new Error("Device is not opened."));
+          return;
+        }
+
+        const payload = new Uint8Array(RAW_BUFFER_SIZE);
+        payload.set(request);
+
+        const timer = setTimeout(() => {
+          device.removeEventListener("inputreport", onInputReport);
+          reject(new Error(`Timeout waiting for response: ${bytesToHex(request)}`));
+        }, timeoutMs);
+
+        function onInputReport(event) {
+          const response = new Uint8Array(event.data.buffer);
+          if (!matcher(response)) {
+            return;
+          }
+          clearTimeout(timer);
+          device.removeEventListener("inputreport", onInputReport);
+          resolve(response);
+        }
+
+        device.addEventListener("inputreport", onInputReport);
+        try {
+          await device.sendReport(outputReportId, payload);
+        } catch (error) {
+          clearTimeout(timer);
+          device.removeEventListener("inputreport", onInputReport);
+          reject(error);
+        }
+      });
+    }
+
+    async function getProtocolVersion() {
+      const response = await sendCommand(
+        new Uint8Array([IDS.GET_PROTOCOL_VERSION]),
+        (bytes) => bytes[0] === IDS.GET_PROTOCOL_VERSION
+      );
+      return (response[1] << 8) | response[2];
+    }
+
+    async function getLayerCount() {
+      const response = await sendCommand(
+        new Uint8Array([IDS.DYNAMIC_KEYMAP_GET_LAYER_COUNT]),
+        (bytes) => bytes[0] === IDS.DYNAMIC_KEYMAP_GET_LAYER_COUNT
+      );
+      return response[1];
+    }
+
+    async function getLayoutOptions() {
+      const response = await sendCommand(
+        new Uint8Array([IDS.GET_KEYBOARD_VALUE, 0x02]),
+        (bytes) => bytes[0] === IDS.GET_KEYBOARD_VALUE && bytes[1] === 0x02
+      );
+      return (response[2] << 24) | (response[3] << 16) | (response[4] << 8) | response[5];
+    }
+
+    async function readDynamicBuffer(offset, size) {
+      const request = new Uint8Array([
+        IDS.DYNAMIC_KEYMAP_GET_BUFFER,
+        (offset >> 8) & 0xff,
+        offset & 0xff,
+        size,
+      ]);
+      const response = await sendCommand(
+        request,
+        (bytes) =>
+          bytes[0] === IDS.DYNAMIC_KEYMAP_GET_BUFFER &&
+          bytes[1] === ((offset >> 8) & 0xff) &&
+          bytes[2] === (offset & 0xff) &&
+          bytes[3] === size
+      );
+      return response.slice(4, 4 + size);
+    }
+
+    async function readMacroCount() {
+      const response = await sendCommand(
+        new Uint8Array([IDS.DYNAMIC_KEYMAP_MACRO_GET_COUNT]),
+        (bytes) => bytes[0] === IDS.DYNAMIC_KEYMAP_MACRO_GET_COUNT
+      );
+      return response[1];
+    }
+
+    async function readMacroBufferSize() {
+      const response = await sendCommand(
+        new Uint8Array([IDS.DYNAMIC_KEYMAP_MACRO_GET_BUFFER_SIZE]),
+        (bytes) => bytes[0] === IDS.DYNAMIC_KEYMAP_MACRO_GET_BUFFER_SIZE
+      );
+      return (response[1] << 8) | response[2];
+    }
+
+    async function readMacroBuffer(offset, size) {
+      const request = new Uint8Array([
+        IDS.DYNAMIC_KEYMAP_MACRO_GET_BUFFER,
+        (offset >> 8) & 0xff,
+        offset & 0xff,
+        size,
+      ]);
+      const response = await sendCommand(
+        request,
+        (bytes) =>
+          bytes[0] === IDS.DYNAMIC_KEYMAP_MACRO_GET_BUFFER &&
+          bytes[1] === ((offset >> 8) & 0xff) &&
+          bytes[2] === (offset & 0xff) &&
+          bytes[3] === size
+      );
+      return response.slice(4, 4 + size);
+    }
+
+    async function dumpKeymaps(layerCount, rows, cols) {
+      const layerSize = rows * cols * 2;
+      const layers = [];
+      const remapKeycodes = [];
+
+      for (let layer = 0; layer < layerCount; layer++) {
+        const layerBytes = new Uint8Array(layerSize);
+        let offset = layer * layerSize;
+        let written = 0;
+        while (written < layerSize) {
+          const size = Math.min(CHUNK_SIZE, layerSize - written);
+          const chunk = await readDynamicBuffer(offset, size);
+          layerBytes.set(chunk, written);
+          offset += size;
+          written += size;
+        }
+
+        const rowsArray = [];
+        const remapLayer = {};
+        for (let row = 0; row < rows; row++) {
+          const rowArray = [];
+          for (let col = 0; col < cols; col++) {
+            const i = (row * cols + col) * 2;
+            const code = (layerBytes[i] << 8) | layerBytes[i + 1];
+            rowArray.push({
+              row,
+              col,
+              code,
+              hex: toHex(code),
+            });
+            remapLayer[`${row},${col}`] = code;
+          }
+          rowsArray.push(rowArray);
+        }
+        layers.push(rowsArray);
+        remapKeycodes.push(remapLayer);
+        log(`Layer ${layer} read (${layerSize} bytes)`);
+      }
+
+      return { layers, remapKeycodes };
+    }
+
+    async function dumpMacros() {
+      try {
+        const count = await readMacroCount();
+        const bufferSize = await readMacroBufferSize();
+        const bytes = new Uint8Array(bufferSize);
+        let offset = 0;
+        while (offset < bufferSize) {
+          const size = Math.min(CHUNK_SIZE, bufferSize - offset);
+          const chunk = await readMacroBuffer(offset, size);
+          bytes.set(chunk, offset);
+          offset += size;
+        }
+        log(`Macro buffer read (${bufferSize} bytes, count ${count})`);
+        return {
+          count,
+          bufferSize,
+          bytes: Array.from(bytes),
+          hex: bytesToHex(bytes),
+        };
+      } catch (error) {
+        log(`Macro dump skipped: ${error.message}`);
+        return {
+          error: error.message,
+        };
+      }
+    }
+
+    connectButton.addEventListener("click", async () => {
+      if (!("hid" in navigator)) {
+        log("WebHIDが使えません。ChromeまたはEdgeで開いてください。");
+        return;
+      }
+
+      const devices = await navigator.hid.requestDevice({
+        filters: [{ vendorId: KEYBALL39_VENDOR_ID, productId: KEYBALL39_PRODUCT_ID }],
+      });
+      if (!devices.length) {
+        log("デバイスが選択されませんでした。");
+        return;
+      }
+
+      device = devices[0];
+      if (!device.opened) {
+        await device.open();
+      }
+      outputReportId = getOutputReportId(device);
+      log(`Connected: ${device.productName || "Unknown"} ${toHex(device.vendorId)}:${toHex(device.productId)}`);
+      log(`Output report ID: ${outputReportId}`);
+      dumpButton.disabled = false;
+    });
+
+    dumpButton.addEventListener("click", async () => {
+      dumpButton.disabled = true;
+      downloadButton.disabled = true;
+      try {
+        const rows = Number(document.getElementById("rows").value);
+        const cols = Number(document.getElementById("cols").value);
+        const maxLayers = Number(document.getElementById("maxLayers").value);
+
+        const protocolVersion = await getProtocolVersion();
+        log(`VIA protocol: ${toHex(protocolVersion)}`);
+
+        const reportedLayerCount = await getLayerCount();
+        const layerCount = Math.min(reportedLayerCount || maxLayers, maxLayers);
+        log(`Layer count: ${reportedLayerCount}, dumping: ${layerCount}`);
+
+        let layoutOptions = null;
+        try {
+          layoutOptions = await getLayoutOptions();
+          log(`Layout options: ${layoutOptions}`);
+        } catch (error) {
+          log(`Layout options skipped: ${error.message}`);
+        }
+
+        const keymaps = await dumpKeymaps(layerCount, rows, cols);
+        const macros = await dumpMacros();
+
+        const dump = {
+          format: "keyball39-via-dump-v1",
+          generatedAt: new Date().toISOString(),
+          device: {
+            vendorId: device.vendorId,
+            productId: device.productId,
+            productName: device.productName || null,
+          },
+          viaProtocolVersion: protocolVersion,
+          matrix: { rows, cols },
+          reportedLayerCount,
+          dumpedLayerCount: layerCount,
+          layoutOptions,
+          keycodes: keymaps.remapKeycodes,
+          layers: keymaps.layers,
+          macros,
+        };
+
+        latestJson = JSON.stringify(dump, null, 2);
+        outputEl.value = latestJson;
+        downloadButton.disabled = false;
+        log("Dump complete.");
+      } catch (error) {
+        log(`ERROR: ${error.stack || error.message}`);
+      } finally {
+        dumpButton.disabled = false;
+      }
+    });
+
+    downloadButton.addEventListener("click", () => {
+      const blob = new Blob([latestJson], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "keyball39_via_dump.json";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
