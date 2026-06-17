@@ -222,8 +222,6 @@ def convert_keycode(code: int) -> str:
     if 0x4000 <= code <= 0x4FFF:
         layer = (code >> 8) & 0x0F
         base = code & 0xFF
-        if layer == 3 and base == 0x29:
-            return "&esc_td"
         return f"&lt {layer} {zmk_key_name(convert_keycode(base))}"
 
     if 0x2000 <= code <= 0x3FFF:
@@ -336,19 +334,9 @@ def build_keymap(dump: dict) -> str:
 
 &trackball {{
     automouse-layer = <4>;
-    scroll-layers = <3 5>;
 }};
 
 / {{
-    behaviors {{
-        esc_td: esc_tap_dance {{
-            compatible = "zmk,behavior-tap-dance";
-            #binding-cells = <0>;
-            tapping-term-ms = <200>;
-            bindings = <&lt 3 ESCAPE>, <&mo 3>;
-        }};
-    }};
-
     macros {{
 {macros}
     }};
