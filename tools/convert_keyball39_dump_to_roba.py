@@ -223,7 +223,7 @@ def convert_keycode(code: int) -> str:
         layer = (code >> 8) & 0x0F
         base = code & 0xFF
         if layer == 3 and base == 0x29:
-            return f"&fast_lt {layer} {zmk_key_name(convert_keycode(base))}"
+            return "&esc_td"
         return f"&lt {layer} {zmk_key_name(convert_keycode(base))}"
 
     if 0x2000 <= code <= 0x3FFF:
@@ -341,14 +341,11 @@ def build_keymap(dump: dict) -> str:
 
 / {{
     behaviors {{
-        fast_lt: fast_layer_tap {{
-            compatible = "zmk,behavior-hold-tap";
-            #binding-cells = <2>;
-            flavor = "tap-preferred";
+        esc_td: esc_tap_dance {{
+            compatible = "zmk,behavior-tap-dance";
+            #binding-cells = <0>;
             tapping-term-ms = <200>;
-            quick-tap-ms = <0>;
-            hold-while-undecided;
-            bindings = <&mo>, <&kp>;
+            bindings = <&lt 3 ESCAPE>, <&mo 3>;
         }};
     }};
 
